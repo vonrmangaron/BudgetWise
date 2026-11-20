@@ -245,7 +245,7 @@
 
   function navHtml() {
     const b = (v, label) => `<button type="button" data-act="nav" data-view="${v}"${view === v ? ' aria-current="page"' : ''}>${ICON[v === 'home' ? 'budget' : v]}${label}</button>`;
-    return `<nav class="nav" aria-label="Main"><div class="nav-in">${b('home', 'Budget')}${b('history', 'History')}${b('setup', 'Setup')}</div></nav>`;
+    return `<nav class="nav" aria-label="Main"><div class="nav-brand"><span class="logo" aria-hidden="true">${ICON.logo}</span>BudgetWise</div><div class="nav-in">${b('home', 'Budget')}${b('history', 'History')}${b('setup', 'Setup')}</div><p class="nav-foot">Saved on this device only</p></nav>`;
   }
 
   function rateBtnHtml() {
@@ -284,9 +284,10 @@
       ['soon', 'Due soon', `${soon.length} in 7 days`, 'dot-soon']
     ].map(([k, label, sub, dot]) => `<button type="button" role="tab" class="tab" id="tab-${k}" aria-controls="panel" aria-selected="${tab === k}" data-act="tab" data-tab="${k}"><span class="tab-l"><span class="dot ${dot}"></span><span>${esc(label)}</span></span><small>${esc(sub)}</small></button>`).join('');
 
-    let panel;
-    if (tab === 'soon') {
-      panel = soon.length ? soon.map(({ d, it }) => {
+    // One list's rows: the phone shows one at a time under the tabs, tablet and desktop show them side by side.
+    const body = key => {
+    if (key === 'soon') {
+      return soon.length ? soon.map(({ d, it }) => {
         const n = daysBetween(t, d), urgent = n <= 1;
         return `<button type="button" class="row" data-act="edit" data-id="${it.id}" style="min-height:62px">
           <span class="cal"><small class="${urgent ? 'urgent' : ''}">${DOW[d.getDay()]}</small><b>${d.getDate()}</b></span>
@@ -296,7 +297,7 @@
       }).join('') + `<p class="hint">Everything due in the next 7 days, from both lists.</p>`
         : `<div class="empty"><b>Nothing due this week</b><span>Costs due in the next 7 days show here.</span></div>`;
     } else {
-      const list = S.items.filter(it => it.list === tab).map(it => ({ it, nd: nextDue(it) }))
+      const list = S.items.filter(it => it.list === key).map(it => ({ it, nd: nextDue(it) }))
         .sort((a, b) => (a.nd ? a.nd.getTime() : 9e15) - (b.nd ? b.nd.getTime() : 9e15));
       const rows = list.map(({ it, nd }) => {
         const n = occurrences(it, from, to).length, dd = nd ? daysBetween(t, nd) : null, ds = debtState(it);
@@ -308,9 +309,15 @@
           <span class="row-amt"><b>${money(it.amt, it.cur)}</b>${conv}<small class="due${dd !== null && dd <= 3 ? ' urgent' : ''}">${nd ? 'due ' + inDays(dd) : ds ? 'paid off' : 'done'}</small></span>
         </button>`;
       }).join('');
-      const empty = `<div class="empty"><b>No ${tab === 'other' ? esc(otherName) : 'local'} costs yet</b><span>${tab === 'other' ? 'Money you send or pay in ' + esc(otherName) + ' — family allowance, loans, bills.' : 'Rent, groceries, phone, transport, bills.'}</span></div>`;
-      panel = (rows || empty) + `<button type="button" class="add-btn" data-act="add" data-list="${tab}">${ICON.plus}Add a cost</button>`;
+      const empty = `<div class="empty"><b>No ${key === 'other' ? esc(otherName) : 'local'} costs yet</b><span>${key === 'other' ? 'Money you send or pay in ' + esc(otherName) + ' — family allowance, loans, bills.' : 'Rent, groceries, phone, transport, bills.'}</span></div>`;
+      return (rows || empty) + `<button type="button" class="add-btn" data-act="add" data-list="${key}">${ICON.plus}Add a cost</button>`;
     }
+    };
+    const cols = [
+      ['other', otherName, money(s.other, p.home) + ' this month', 'dot-other'],
+      ['home', 'Local', money(s.home, p.home) + ' this month', 'dot-home'],
+      ['soon', 'Due soon', 'next 7 days', 'dot-soon']
+    ].map(([k, label, sub, dot]) => `<section class="col col-${k}" aria-label="${esc(label)}"><header class="col-h"><span class="dot ${dot}"></span><h2>${esc(label)}</h2><small>${esc(sub)}</small></header><div class="col-b">${body(k)}</div></section>`).join('');
 
     return `<div class="wrap">
       <header class="top">
@@ -332,7 +339,8 @@
         ${s.missing ? `<div class="hero-note">Some ${esc(otherName)} costs aren't counted yet — no exchange rate. Tap the rate button or set one in Setup.</div>` : ''}
       </section>
       <div class="tabs" role="tablist" aria-label="Budget lists">${tabs}</div>
-      <div class="panel" id="panel" role="tabpanel" aria-labelledby="tab-${tab}">${panel}</div>
+      <div class="panel" id="panel" role="tabpanel" aria-labelledby="tab-${tab}">${body(tab)}</div>
+      <div class="cols">${cols}</div>
     </div>${navHtml()}`;
   }
 
@@ -348,9 +356,9 @@
     const chartMonths = months.slice(0, 6).reverse();
     const max = Math.max(1, ...chartMonths.map(m => Math.abs(m.saved)));
     const bars = chartMonths.map(m => {
-      const d = keyToDate(m.key), h = Math.max(4, Math.round(Math.abs(m.saved) / max * 62));
+      const d = keyToDate(m.key), h = Math.max(0.06, Math.abs(m.saved) / max).toFixed(3);
       return `<button type="button" data-act="month" data-key="${m.key}" aria-pressed="${openMonth === m.key}" aria-label="${MON_LONG[d.getMonth()]}: saved ${esc(money(m.saved, m.homeCur))}">
-        <small>${m.saved < 0 ? '−' : ''}${Math.abs(m.saved) >= 1000 ? (Math.abs(m.saved) / 1000).toFixed(1) + 'k' : Math.round(Math.abs(m.saved))}</small><i class="${m.saved < 0 ? 'neg' : ''}" style="height:${h}px"></i><b>${MON[d.getMonth()]}</b></button>`;
+        <small>${m.saved < 0 ? '−' : ''}${Math.abs(m.saved) >= 1000 ? (Math.abs(m.saved) / 1000).toFixed(1) + 'k' : Math.round(Math.abs(m.saved))}</small><i class="${m.saved < 0 ? 'neg' : ''}" style="--h:${h}"></i><b>${MON[d.getMonth()]}</b></button>`;
     }).join('');
 
     const rows = months.map(m => {
@@ -401,7 +409,7 @@
     const head = first
       ? `<div class="welcome"><div class="brand"><div class="logo" aria-hidden="true">${ICON.logo}</div>BudgetWise</div><h1>Set up your budget</h1><p>Takes a minute. Everything stays on this phone — no account, no login.</p></div>`
       : `<h1 class="page">Setup</h1>`;
-    return `<div class="wrap${first ? ' first' : ''}">
+    return `<div class="wrap narrow${first ? ' first' : ''}">
       ${head}
       <form class="setup" id="setup" novalidate>
         <label class="fld"><span>Your name</span><input class="inp" name="name" value="${esc(p.name)}" autocomplete="given-name" maxlength="40" required></label>

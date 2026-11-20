@@ -1,5 +1,5 @@
 // Bump CACHE on every release so phones pick up the new files.
-const CACHE = 'budgetwise-v1';
+const CACHE = 'budgetwise-v2';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'manifest.json', 'icon.svg', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {
