@@ -63,12 +63,12 @@ window.Cloud = (() => {
   }
   // Returns the session, or null when the project asks people to confirm their email first.
   async function signUp(email, password) {
-    const j = await call('/auth/v1/signup', { method: 'POST', body: { email, password }, headers: { 'X-Redirect-To': redirect() } });
+    const j = await call('/auth/v1/signup?redirect_to=' + encodeURIComponent(redirect()), { method: 'POST', body: { email, password } });
     if (j && j.access_token) { keep(fromAuth(j)); return session; }
     return null;
   }
   async function forgot(email) {
-    await call('/auth/v1/recover', { method: 'POST', body: { email }, headers: { 'X-Redirect-To': redirect() } });
+    await call('/auth/v1/recover?redirect_to=' + encodeURIComponent(redirect()), { method: 'POST', body: { email } });
   }
   async function setPassword(password) {
     const t = await token();
