@@ -1,6 +1,7 @@
 'use strict';
 (() => {
-  const KEY = 'budgetwise.v1';
+  const KEY = 'budgetwise.v1'; // budgets saved before accounts (device only)
+  const userKey = () => 'budgetwise.u.' + Cloud.user.id;
   const RATE_API = 'https://open.er-api.com/v6/latest/';
   const RATE_MAX_AGE = 6 * 3600e3;
 
@@ -31,8 +32,13 @@
   const UNIT = { week: 7, fortnight: 14, month: 30.44, quarter: 91.31, year: 365.25 };
 
   const ICON = {
+    pen: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/></svg>',
+    x: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+    chevL: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>',
+    chevR: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>',
     logo: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#5EEAD4" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 17l5-5 4 3 7-8"/><path d="M15 7h5v5"/></svg>',
     refresh: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>',
+    check: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
     plus: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
     chev: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>',
     budget: '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="18" height="13" rx="2"/><path d="M3 10h18M16 15h2"/></svg>',
@@ -44,27 +50,114 @@
   const $modal = document.getElementById('modal-root');
   const $toast = document.getElementById('toast');
 
-  let S = load();
-  let view = S.profile ? 'home' : 'setup';
+  let S = blank();
+  let meta = { rev: 0, dirty: false, editedAt: 0 }; // rev = cloud time we last matched; dirty = changes not in the cloud yet
+  let view = 'auth';
+  let authMode = 'in', authMsg = null, authBusy = false;
+  let sync = { state: 'idle', at: 0 };
+  let pushTimer = 0, pushing = false, editSeq = 0;
+  let confirmOut = false;
   let tab = 'other';
   let openMonth = null;
   let draft = null;
+  let payDraft = null;
   let confirmReset = false;
   let rateBusy = false;
   let undo = null;
   let toastTimer = 0;
 
   // ---------- storage ----------
-  function blank() { return { v: 1, profile: null, items: [], rate: null, history: {}, seen: null, nextId: 1 }; }
-  function load() {
+  function blank() { return { v: 1, profile: null, items: [], rate: null, history: {}, pay: {}, seen: null, nextId: 1 }; }
+  const tidy = s => s && s.v === 1 ? Object.assign(blank(), s) : null;
+  // This device keeps a copy of the account's budget so it opens fast and works offline.
+  function loadLocal() {
     try {
-      const s = JSON.parse(localStorage.getItem(KEY));
-      if (s && s.v === 1) return Object.assign(blank(), s);
+      const c = JSON.parse(localStorage.getItem(userKey()));
+      if (c && tidy(c.S)) { meta = Object.assign({ rev: 0, dirty: false, editedAt: 0 }, c.meta); return tidy(c.S); }
     } catch (e) { /* storage blocked or corrupt */ }
+    meta = { rev: 0, dirty: false, editedAt: 0 };
     return blank();
   }
+  function saveLocal() {
+    if (!Cloud.user) return;
+    try { localStorage.setItem(userKey(), JSON.stringify({ S, meta })); } catch (e) { /* storage blocked: the cloud still has it */ }
+  }
+  function readLegacy() {
+    try { return tidy(JSON.parse(localStorage.getItem(KEY))); } catch (e) { return null; }
+  }
+  // A change the person made: keep it here and send it to the account.
   function save() {
-    try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { toast('Could not save on this device'); }
+    meta.dirty = true; meta.editedAt = Date.now(); editSeq++;
+    saveLocal();
+    clearTimeout(pushTimer);
+    pushTimer = setTimeout(push, 700);
+  }
+  async function push() {
+    if (!Cloud.user || !meta.dirty) return;
+    if (pushing) { clearTimeout(pushTimer); pushTimer = setTimeout(push, 700); return; }
+    pushing = true;
+    const seq = editSeq;
+    setSync('saving');
+    try {
+      const at = await Cloud.store(S);
+      meta.rev = at;
+      if (seq === editSeq) meta.dirty = false;
+      saveLocal();
+      setSync('ok');
+      if (meta.dirty) { clearTimeout(pushTimer); pushTimer = setTimeout(push, 700); }
+    } catch (e) { syncFailed(e); }
+    pushing = false;
+  }
+  // Pick up changes made on another phone or computer.
+  async function pull() {
+    if (!Cloud.user) return;
+    try {
+      const row = await Cloud.load();
+      if (!row) {
+        let moved = false;
+        if (!S.profile) { const old = readLegacy(); if (old && old.profile) { S = old; moved = true; } }
+        if (S.profile) {
+          meta.dirty = true; meta.editedAt = Date.now(); editSeq++;
+          await push();
+          if (moved && !meta.dirty) {
+            try { localStorage.setItem(KEY + '.moved', localStorage.getItem(KEY)); localStorage.removeItem(KEY); } catch (e) { /* ignore */ }
+            toast('Your budget from this device is now saved in your account');
+          }
+        } else setSync('ok');
+        settle();
+        return;
+      }
+      if (row.at > meta.rev && (!meta.dirty || row.at > meta.editedAt)) {
+        const d = tidy(row.data);
+        if (d) { S = d; meta = { rev: row.at, dirty: false, editedAt: 0 }; saveLocal(); }
+        setSync('ok');
+        settle();
+      } else if (meta.dirty) await push();
+      else setSync('ok');
+    } catch (e) { syncFailed(e); }
+  }
+  // After the budget changed underneath: open the right page and redraw (not while a pop-up is open).
+  function settle() {
+    rollover();
+    if (view === 'auth') return;
+    if (!S.profile) view = 'setup';
+    else if (view === 'setup' && document.getElementById('setup-first')) view = 'home';
+    if (!draft && !payDraft) render();
+  }
+  function syncFailed(e) {
+    if (!Cloud.user) { toSignIn('Please sign in again.'); return; }
+    setSync(e.offline ? 'offline' : 'error');
+  }
+  function setSync(state) {
+    sync = { state, at: state === 'ok' ? Date.now() : sync.at };
+    document.querySelectorAll('[data-sync]').forEach(el => { el.textContent = syncText(); el.dataset.sync = sync.state; });
+  }
+  function syncText() {
+    if (sync.state === 'saving') return 'Saving…';
+    if (sync.state === 'offline') return meta.dirty ? 'Offline — will save when back online' : 'Offline';
+    if (sync.state === 'error') return 'Could not save — will try again';
+    if (sync.state === 'ok') return 'Saved to your account · ' + clock(sync.at);
+    return 'Connecting…';
   }
 
   // ---------- helpers ----------
@@ -120,6 +213,8 @@
     }
     return out;
   }
+  // Paid ticks: the due dates already paid (ymd strings).
+  const isPaid = (it, d) => !!(it.paid && it.paid.includes(ymd(d)));
   const nextDue = it => occurrences(it, today(), addDays(today(), 800))[0] || null;
   function debtState(it) {
     if (!isDebt(it)) return null;
@@ -164,44 +259,66 @@
   function rateValue() {
     const p = S.profile;
     if (p.home === p.other) return 1;
-    return S.rate && S.rate.pair === pairKey() ? S.rate.value : null;
+    if (!S.rate || S.rate.pair !== pairKey()) return null;
+    if (S.rate.manual) return S.rate.value;
+    const v = S.rate.value - (p.margin || 0); // e.g. a remittance service's rate: market minus their margin
+    return v > 0 ? v : null;
   }
   function toHome(amount, cur, rate = rateValue()) {
     if (cur === S.profile.home) return amount;
     return rate ? amount / rate : null;
   }
+  // Pay for each payday (the usual salary unless changed for that month) plus any extra income added to the month.
+  function monthPay(key) { return (S.pay && S.pay[key]) || { pays: {}, extras: [] }; }
+  function income(from, to) {
+    const base = S.profile.salary, lines = [];
+    const days = paydays(from, to);
+    let total = 0, changed = false;
+    for (const d of days) {
+      const o = monthPay(monthKey(d)).pays[ymd(d)];
+      const amt = o != null ? o : base;
+      if (o != null && o !== base) changed = true;
+      total += amt;
+      lines.push({ kind: 'pay', date: ymd(d), amt });
+    }
+    for (let m = new Date(from.getFullYear(), from.getMonth(), 1); m <= to; m = new Date(m.getFullYear(), m.getMonth() + 1, 1)) {
+      for (const x of monthPay(monthKey(m)).extras) { total += x.amt; lines.push({ kind: 'extra', name: x.name, amt: x.amt }); }
+    }
+    return { pays: days.length, total, lines, changed, extra: lines.filter(l => l.kind === 'extra').reduce((a, l) => a + l.amt, 0) };
+  }
   function summary(from, to, rate = rateValue()) {
-    const pays = paydays(from, to).length, income = pays * S.profile.salary;
-    const t = { other: 0, home: 0 }, lines = [];
+    const inc = income(from, to), pays = inc.pays, income_ = inc.total;
+    const t = { other: 0, home: 0 }, due = { other: 0, home: 0 }, lines = [];
     let missing = false;
     for (const it of S.items) {
-      const n = occurrences(it, from, to).length;
+      const occ = occurrences(it, from, to), n = occ.length;
       if (!n) continue;
       const v = toHome(it.amt, it.cur, rate);
       if (v == null) { missing = true; continue; }
       t[it.list] += n * v;
+      due[it.list] += occ.filter(d => !isPaid(it, d)).length * v;
       lines.push({ list: it.list, name: it.name, n, amt: n * v });
     }
-    return { pays, income, other: t.other, home: t.home, costs: t.other + t.home, saved: income - t.other - t.home, missing, lines };
+    return { left: due.other + due.home, leftOther: due.other, leftHome: due.home, pays, income: income_, payLines: inc.lines, payChanged: inc.changed, extra: inc.extra, other: t.other, home: t.home, costs: t.other + t.home, saved: income_ - t.other - t.home, missing, lines };
   }
 
   // A finished month is kept in History the first time the app opens in a later month.
   function rollover() {
     if (!S.profile) return;
     const cur = monthKey(today());
-    if (!S.seen) { S.seen = cur; save(); return; }
+    if (!S.seen) { S.seen = cur; saveLocal(); return; }
     let changed = false;
     for (let k = S.seen; k < cur; k = nextMonthKey(k)) {
       if (S.history[k]) continue;
       const f = keyToDate(k), s = summary(f, monthEnd(f));
       S.history[k] = {
-        pays: s.pays, income: s.income, salary: S.profile.salary, other: s.other, home: s.home, saved: s.saved,
+        pays: s.pays, income: s.income, salary: S.profile.salary, payLines: s.payLines, other: s.other, home: s.home, saved: s.saved,
         rate: rateValue(), homeCur: S.profile.home, otherCur: S.profile.other, lines: s.lines
       };
       changed = true;
     }
     if (S.seen !== cur) { S.seen = cur; changed = true; }
-    if (changed) save();
+    if (changed) saveLocal();
   }
 
   // ---------- exchange rate ----------
@@ -218,8 +335,8 @@
       const value = j && j.rates && j.rates[p.other];
       if (!value) throw new Error('no rate');
       S.rate = { pair: pairKey(), value, at: Date.now(), manual: false };
-      save();
-      if (force) toast(`Rate updated: ${sym(p.home)}1 = ${sym(p.other)}${value.toFixed(2)}`);
+      saveLocal();
+      if (force) toast(`Rate updated: ${sym(p.home)}1 = ${sym(p.other)}${rateValue().toFixed(2)}`);
     } catch (e) {
       if (force) toast(rateValue() ? 'Offline — using the saved rate' : 'Could not get a rate. Check your internet, or set your own rate in Setup.');
     }
@@ -238,14 +355,15 @@
 
   // ---------- views ----------
   function render() {
-    if (!S.profile) view = 'setup';
-    $app.innerHTML = view === 'setup' ? setupHtml() : view === 'history' ? historyHtml() : homeHtml();
+    if (!Cloud.user) view = 'auth';
+    else if (view !== 'auth' && !S.profile) view = 'setup';
+    $app.innerHTML = view === 'auth' ? authHtml() : view === 'setup' ? setupHtml() : view === 'history' ? historyHtml() : homeHtml();
     if (view === 'setup') syncSetup();
   }
 
   function navHtml() {
     const b = (v, label) => `<button type="button" data-act="nav" data-view="${v}"${view === v ? ' aria-current="page"' : ''}>${ICON[v === 'home' ? 'budget' : v]}${label}</button>`;
-    return `<nav class="nav" aria-label="Main"><div class="nav-brand"><span class="logo" aria-hidden="true">${ICON.logo}</span>BudgetWise</div><div class="nav-in">${b('home', 'Budget')}${b('history', 'History')}${b('setup', 'Setup')}</div><p class="nav-foot">Saved on this device only</p></nav>`;
+    return `<nav class="nav" aria-label="Main"><div class="nav-brand"><span class="logo" aria-hidden="true">${ICON.logo}</span>BudgetWise</div><div class="nav-in">${b('home', 'Budget')}${b('history', 'History')}${b('setup', 'Setup')}</div><p class="nav-foot"><span class="sync-dot" data-sync="${sync.state}">${esc(syncText())}</span></p></nav>`;
   }
 
   function rateBtnHtml() {
@@ -253,7 +371,7 @@
     if (p.home === p.other) return '';
     const v = rateValue();
     const main = v ? `${sym(p.home)}1 = ${sym(p.other)}${v.toFixed(2)}` : 'No rate yet';
-    const sub = rateBusy ? 'checking…' : !v ? 'tap to get it' : S.rate.manual ? 'your own rate' : since(S.rate.at);
+    const sub = rateBusy ? 'checking…' : !v ? 'tap to get it' : S.rate.manual ? 'your own rate' : (p.margin ? `market −${p.margin} · ` : '') + since(S.rate.at);
     return `<button type="button" class="rate-btn${rateBusy ? ' busy' : ''}" data-act="rate" aria-label="Exchange rate ${esc(main)}, ${esc(sub)}. Tap to check now."><span><b>${esc(main)}</b><small>${esc(sub)}</small></span>${ICON.refresh}</button>`;
   }
 
@@ -275,7 +393,7 @@
     const badge = s.income <= 0 ? 'no payday' : s.saved >= 0 ? Math.round(s.saved / s.income * 100) + '% of income' : 'cut costs';
 
     const soon = [];
-    for (const it of S.items) for (const d of occurrences(it, t, addDays(t, 7))) soon.push({ d, it });
+    for (const it of S.items) for (const d of occurrences(it, t, addDays(t, 7))) if (!isPaid(it, d)) soon.push({ d, it });
     soon.sort((a, b) => a.d - b.d);
 
     const tabs = [
@@ -300,22 +418,27 @@
       const list = S.items.filter(it => it.list === key).map(it => ({ it, nd: nextDue(it) }))
         .sort((a, b) => (a.nd ? a.nd.getTime() : 9e15) - (b.nd ? b.nd.getTime() : 9e15));
       const rows = list.map(({ it, nd }) => {
-        const n = occurrences(it, from, to).length, dd = nd ? daysBetween(t, nd) : null, ds = debtState(it);
+        const occ = occurrences(it, from, to), n = occ.length, dd = nd ? daysBetween(t, nd) : null, ds = debtState(it);
+        const np = occ.filter(d => isPaid(it, d)).length, allPaid = n > 0 && np === n;
+        const ini = `<span class="ini ini-${it.list}" aria-hidden="true">${esc((it.name.trim()[0] || '?').toUpperCase())}</span>`;
+        const tick = n ? `<button type="button" class="tick${allPaid ? ' on' : np ? ' part' : ''}" data-act="paid" data-id="${it.id}" aria-pressed="${allPaid}" aria-label="${esc(it.name)}: ${allPaid ? 'paid this month. Tap to undo.' : 'mark as paid'}${n > 1 ? ` (${np} of ${n} paid)` : ''}">${allPaid ? ICON.check : np ? `<small>${np}/${n}</small>` : ICON.check}</button>` : '';
+        const status = allPaid ? '<small class="due paid">paid ✓</small>' : np ? `<small class="due paid">${np} of ${n} paid</small>`
+          : `<small class="due${dd !== null && dd <= 3 ? ' urgent' : ''}">${nd ? 'due ' + inDays(dd) : ds ? 'paid off' : 'done'}</small>`;
         const conv = it.cur !== p.home ? (rate ? `<small>≈ ${money(it.amt / rate, p.home)}</small>` : '<small>needs a rate</small>') : '';
         const debtTag = ds ? `<span class="tag-debt">${ds.remaining ? `${ds.remaining} left · ends ${MON[ds.end.getMonth()]} ${ds.end.getFullYear()}` : 'Paid off'}</span>` : '';
-        return `<button type="button" class="row${nd ? '' : ' done'}" data-act="edit" data-id="${it.id}">
-          <span class="ini ini-${it.list}" aria-hidden="true">${esc((it.name.trim()[0] || '?').toUpperCase())}</span>
+        return `<div class="row-w${allPaid ? ' is-paid' : ''}">${tick}<button type="button" class="row${nd || n ? '' : ' done'}${tick ? ' has-tick' : ''}" data-act="edit" data-id="${it.id}">
+          ${tick ? '' : ini}
           <span class="row-main"><span class="row-name">${esc(it.name)}</span><span class="row-sub">${esc(dueDesc(it))}${n > 1 ? ` · ${n}× this month` : ''}</span>${debtTag}</span>
-          <span class="row-amt"><b>${money(it.amt, it.cur)}</b>${conv}<small class="due${dd !== null && dd <= 3 ? ' urgent' : ''}">${nd ? 'due ' + inDays(dd) : ds ? 'paid off' : 'done'}</small></span>
-        </button>`;
+          <span class="row-amt"><b>${money(it.amt, it.cur)}</b>${conv}${status}</span>
+        </button></div>`;
       }).join('');
       const empty = `<div class="empty"><b>No ${key === 'other' ? esc(otherName) : 'local'} costs yet</b><span>${key === 'other' ? 'Money you send or pay in ' + esc(otherName) + ' — family allowance, loans, bills.' : 'Rent, groceries, phone, transport, bills.'}</span></div>`;
       return (rows || empty) + `<button type="button" class="add-btn" data-act="add" data-list="${key}">${ICON.plus}Add a cost</button>`;
     }
     };
     const cols = [
-      ['other', otherName, money(s.other, p.home) + ' this month', 'dot-other'],
-      ['home', 'Local', money(s.home, p.home) + ' this month', 'dot-home'],
+      ['other', otherName, money(s.other, p.home) + ' this month' + (s.leftOther < s.other - 0.005 ? ` · ${money(s.leftOther, p.home)} to pay` : ''), 'dot-other'],
+      ['home', 'Local', money(s.home, p.home) + ' this month' + (s.leftHome < s.home - 0.005 ? ` · ${money(s.leftHome, p.home)} to pay` : ''), 'dot-home'],
       ['soon', 'Due soon', 'next 7 days', 'dot-soon']
     ].map(([k, label, sub, dot]) => `<section class="col col-${k}" aria-label="${esc(label)}"><header class="col-h"><span class="dot ${dot}"></span><h2>${esc(label)}</h2><small>${esc(sub)}</small></header><div class="col-b">${body(k)}</div></section>`).join('');
 
@@ -332,8 +455,8 @@
         </div>
         <div class="bar" aria-hidden="true"><span style="width:${pct(s.other)};background:var(--other-bar)"></span><span style="width:${pct(s.home)};background:var(--home-bar)"></span></div>
         <div class="hero-grid">
-          <div><small>Income</small><b>${money(s.income, p.home)}</b><small>${s.pays} payday${s.pays === 1 ? '' : 's'}</small></div>
-          <div><small>Costs</small><b>${money(s.costs, p.home)}</b><small>both lists</small></div>
+          <button type="button" class="pay-btn" data-act="pay" aria-label="Income ${esc(money(s.income, p.home))}. Change this month's pay."><small>Income ${ICON.pen}</small><b>${money(s.income, p.home)}</b><small class="${s.extra || s.payChanged ? 'accent' : ''}">${s.extra ? '+' + money(s.extra, p.home) + ' extra' : s.payChanged ? 'pay changed' : `${s.pays} payday${s.pays === 1 ? '' : 's'}`}</small></button>
+          <div><small>Costs</small><b>${money(s.costs, p.home)}</b><small${s.costs > 0 && s.left < 0.005 ? ' class="accent"' : ''}>${s.costs <= 0 ? 'both lists' : s.left < 0.005 ? 'all paid' : s.left < s.costs - 0.005 ? money(s.left, p.home) + ' to pay' : 'none paid yet'}</small></div>
           <div><small>Next pay</small><b>${np ? shortDate(np) : '—'}</b><small class="accent">${np ? inDays(daysBetween(t, np)) : ''}</small></div>
         </div>
         ${s.missing ? `<div class="hero-note">Some ${esc(otherName)} costs aren't counted yet — no exchange rate. Tap the rate button or set one in Setup.</div>` : ''}
@@ -347,7 +470,7 @@
   function historyHtml() {
     const p = S.profile, t = today(), cur = monthKey(t);
     const live = summary(new Date(t.getFullYear(), t.getMonth(), 1), monthEnd(t));
-    const months = [{ key: cur, live: true, pays: live.pays, income: live.income, salary: p.salary, other: live.other, home: live.home, saved: live.saved, rate: rateValue(), homeCur: p.home, otherCur: p.other, lines: live.lines }]
+    const months = [{ key: cur, live: true, pays: live.pays, income: live.income, salary: p.salary, payLines: live.payLines, other: live.other, home: live.home, saved: live.saved, rate: rateValue(), homeCur: p.home, otherCur: p.other, lines: live.lines }]
       .concat(Object.keys(S.history).filter(k => k < cur).sort().reverse().map(k => Object.assign({ key: k }, S.history[k])));
     const first = months[months.length - 1].key;
     const total = months.reduce((a, m) => a + m.saved, 0);
@@ -373,7 +496,7 @@
           <span class="trio"><span><small>Income</small><b>${money(m.income, m.homeCur)}</b></span><span><small>Costs</small><b>${money(m.other + m.home, m.homeCur)}</b></span><span><small>Saved</small><b class="${m.saved < 0 ? 'lost' : 'saved'}">${money(m.saved, m.homeCur)}</b></span></span>
         </button>
         ${open ? `<div class="detail">
-          <div><span class="k">Paydays</span><span>${m.pays} × ${money(m.salary, m.homeCur)}</span></div>
+          ${payDetail(m)}
           <div><span class="lst"><span class="dot dot-other"></span>${esc(otherLabel)}</span><span>${money(m.other, m.homeCur)}</span></div>${lines('other')}
           <div><span class="lst"><span class="dot dot-home"></span>Local</span><span>${money(m.home, m.homeCur)}</span></div>${lines('home')}
           ${m.otherCur !== m.homeCur ? `<div><span class="k">Rate used</span><span>${m.rate ? `${sym(m.homeCur)}1 = ${sym(m.otherCur)}${m.rate.toFixed(2)}` : 'none'}</span></div>` : ''}
@@ -397,6 +520,19 @@
     </div>${navHtml()}`;
   }
 
+  // Income lines in a month's History detail: one line per payday when the pay changed, plus extra income.
+  function payDetail(m) {
+    const pl = m.payLines;
+    if (!pl) return `<div><span class="k">Paydays</span><span>${m.pays} × ${money(m.salary, m.homeCur)}</span></div>`;
+    const pays = pl.filter(l => l.kind === 'pay'), extras = pl.filter(l => l.kind === 'extra');
+    const same = pays.every(l => l.amt === m.salary);
+    let h = `<div><span class="k">Income</span><span>${money(m.income, m.homeCur)}</span></div>`;
+    h += same ? (pays.length ? `<div class="li"><span>${pays.length} payday${pays.length === 1 ? '' : 's'} × ${money(m.salary, m.homeCur)}</span><span>${money(pays.length * m.salary, m.homeCur)}</span></div>` : '')
+      : pays.map(l => `<div class="li"><span>Pay ${shortDate(parse(l.date))}</span><span>${money(l.amt, m.homeCur)}</span></div>`).join('');
+    h += extras.map(l => `<div class="li"><span>${esc(l.name)}</span><span>+${money(l.amt, m.homeCur)}</span></div>`).join('');
+    return h;
+  }
+
   function currencyOptions(selected) {
     return CURRENCIES.slice().sort((a, b) => a[1].localeCompare(b[1]))
       .map(([code, country, s]) => `<option value="${code}"${code === selected ? ' selected' : ''}>${esc(country)} · ${esc(s.trim())}</option>`).join('');
@@ -406,8 +542,10 @@
     const first = !S.profile;
     const p = S.profile || { name: '', home: 'AUD', other: 'PHP', salary: '', freq: 'fortnight', last: ymd(today()), nth: 3, wd: 5 };
     const manual = !!(S.rate && S.rate.manual && S.profile && S.rate.pair === pairKey());
+    const rmode = manual ? 'own' : p.margin ? 'margin' : 'market';
+    const market = S.profile && S.rate && !S.rate.manual && S.rate.pair === pairKey() ? S.rate.value : null;
     const head = first
-      ? `<div class="welcome"><div class="brand"><div class="logo" aria-hidden="true">${ICON.logo}</div>BudgetWise</div><h1>Set up your budget</h1><p>Takes a minute. Everything stays on this phone — no account, no login.</p></div>`
+      ? `<div class="welcome"><div class="brand"><div class="logo" aria-hidden="true">${ICON.logo}</div>BudgetWise</div><h1 id="setup-first">Set up your budget</h1><p>Takes a minute. It's saved to your account, so you can open it on any phone or computer.</p></div>`
       : `<h1 class="page">Setup</h1>`;
     return `<div class="wrap narrow${first ? ' first' : ''}">
       ${head}
@@ -420,8 +558,9 @@
           </div>
           <small>Your two lists and the exchange rate follow these.</small>
         </div>
-        <label class="fld"><span>Salary each payday (after tax)</span>
+        <label class="fld"><span>Usual salary each payday (after tax)</span>
           <span class="prefix"><span id="sal-sym">${esc(sym(p.home).trim())}</span><input name="salary" inputmode="decimal" value="${p.salary ? esc(Number(p.salary).toFixed(2)) : ''}" placeholder="0.00" autocomplete="off" required></span>
+          <small>Pay changes some months — a bonus, overtime, fewer hours? Tap Income on the Budget page to change any month.</small>
         </label>
         <fieldset class="fld" style="border:0;margin:0;padding:0">
           <legend class="lbl" style="padding:0;margin-bottom:6px">When does your salary arrive?</legend>
@@ -439,24 +578,122 @@
         </fieldset>
         <div class="box"><span class="eyebrow">Your next paydays</span><div class="tiles" id="pay-tiles"></div></div>
         ${first ? '' : `<div class="box" id="rate-box">
-          <label class="chk"><input type="checkbox" name="manual"${manual ? ' checked' : ''}> Use my own exchange rate</label>
+          <span class="lbl">Exchange rate</span>
+          <input type="hidden" name="ratemode" value="${rmode}">
+          <div class="rate-opts">${[['market', 'Market rate', 'Checked automatically'], ['margin', 'Market rate minus a margin', 'Matches a money transfer service, e.g. Remitly or Wise'], ['own', 'My own fixed rate', 'You type it in and change it yourself']]
+            .map(([k, l, h]) => `<button type="button" class="opt" data-act="ratemode" data-mode="${k}" aria-pressed="${rmode === k}"><span class="radio"></span><span><b>${l}</b><small>${h}</small></span></button>`).join('')}</div>
+          <div class="fld" id="margin-f"><span class="sub">How much less than the market rate they give you</span>
+            <span class="prefix"><span id="margin-l">${esc(sym(p.other).trim())}</span><input name="margin" inputmode="decimal" value="${p.margin ? esc(p.margin) : ''}" placeholder="0.42"></span>
+            <small id="margin-t" class="ok" data-market="${market || ''}"></small></div>
           <div class="fld" id="manual-f"><span class="sub">e.g. your remittance centre's rate</span>
             <span class="prefix"><span id="rate-l">${esc(sym(p.home).trim())}1 =</span><input name="rate" inputmode="decimal" value="${manual ? esc(S.rate.value) : ''}" placeholder="${rateValue() ? esc(rateValue().toFixed(2)) : '0.00'}"></span></div>
-          <span class="credit">Otherwise the market rate is checked automatically. <a href="https://www.exchangerate-api.com" target="_blank" rel="noopener">Rates by Exchange Rate API</a></span>
+          <span class="credit">Market rates by <a href="https://www.exchangerate-api.com" target="_blank" rel="noopener">Exchange Rate API</a>, checked every few hours.</span>
         </div>`}
         <p class="err" id="setup-err" hidden></p>
         <button class="btn" type="submit">${first ? 'Start my budget' : 'Save changes'}</button>
       </form>
-      ${first ? '' : `<h2 class="section-t">Your data</h2>
+      ${first ? '' : `<h2 class="section-t">Your account</h2>
       <div class="box">
-        <span class="sub">Your budget lives only in this browser. Save a backup file now and then, so you can restore it on a new phone or if the browser is cleared.</span>
+        <div class="acct"><span class="acct-ini" aria-hidden="true">${esc((Cloud.user.email[0] || '?').toUpperCase())}</span><span class="acct-m"><b>${esc(Cloud.user.email)}</b><small class="sync-dot" data-sync="${sync.state}">${esc(syncText())}</small></span></div>
+        <span class="sub">Sign in with this email on any phone, tablet or computer to see the same budget.</span>
+        <div class="btn-row"><button type="button" class="btn-ghost" data-act="signout">${confirmOut ? 'Not saved yet — tap again to sign out' : 'Sign out'}</button></div>
+      </div>
+      <h2 class="section-t">Your data</h2>
+      <div class="box">
+        <span class="sub">Save a backup file now and then if you like — you can restore it into any account. A cost list file adds its costs to your budget.</span>
         <div class="btn-row">
           <button type="button" class="btn-ghost" data-act="backup">Save backup</button>
-          <label class="btn-ghost" style="display:flex;align-items:center;cursor:pointer">Restore<input type="file" accept="application/json,.json" data-act="restore" hidden></label>
-          <button type="button" class="btn-danger" data-act="reset">${confirmReset ? 'Tap again to delete everything' : 'Start over'}</button>
+          <label class="btn-ghost" style="display:flex;align-items:center;cursor:pointer">Restore or import<input type="file" accept="application/json,.json" data-act="restore" hidden></label>
+          <button type="button" class="btn-danger" data-act="reset">${confirmReset ? 'Tap again to delete your whole budget' : 'Start over'}</button>
         </div>
       </div>`}
-    </div>${first ? '' : navHtml()}`;
+    </div>${first ? `<p class="hint" style="text-align:center">Signed in as ${esc(Cloud.user.email)} · <button type="button" class="link" data-act="signout">Sign out</button></p>` : navHtml()}`;
+  }
+
+  // ---------- sign in ----------
+  function authHtml() {
+    const m = authMode;
+    const t = { in: ['Welcome back', 'Sign in to see your budget.'], up: ['Create your account', 'Your budget is saved to your account, so you can open it on any phone or computer.'],
+      forgot: ['Forgot your password?', "Enter your email and we'll send you a link to set a new one."], reset: ['Set a new password', 'Choose a new password for ' + esc(Cloud.user ? Cloud.user.email : 'your account') + '.'] }[m];
+    const email = `<label class="fld"><span>Email</span><input class="inp" type="email" name="email" autocomplete="email" inputmode="email" required></label>`;
+    const pw = (label, ac) => `<label class="fld"><span>${label}</span><span class="pw"><input class="inp" type="password" name="password" autocomplete="${ac}" required><button type="button" class="pw-eye" data-act="peek" aria-label="Show password">Show</button></span>${m === 'in' ? '' : '<small>At least 8 characters.</small>'}</label>`;
+    const fields = m === 'in' ? email + pw('Password', 'current-password') : m === 'up' ? email + pw('Password', 'new-password') : m === 'forgot' ? email : pw('New password', 'new-password');
+    const btn = { in: 'Sign in', up: 'Create account', forgot: 'Send reset link', reset: 'Save new password' }[m];
+    const links = m === 'in' ? `<button type="button" class="link" data-act="auth-mode" data-mode="forgot">Forgot password?</button><span>New here? <button type="button" class="link" data-act="auth-mode" data-mode="up">Create an account</button></span>`
+      : m === 'reset' ? '' : `<span>${m === 'up' ? 'Already have an account?' : ''} <button type="button" class="link" data-act="auth-mode" data-mode="in">${m === 'up' ? 'Sign in' : 'Back to sign in'}</button></span>`;
+    const note = !Cloud.configured() ? `<p class="err">Accounts aren't switched on yet for this copy of BudgetWise.</p>`
+      : authMsg ? `<p class="${authMsg.ok ? 'note-ok' : 'err'}" role="alert">${esc(authMsg.text)}</p>` : '';
+    return `<div class="wrap narrow first auth">
+      <div class="welcome"><div class="brand"><div class="logo" aria-hidden="true">${ICON.logo}</div>BudgetWise</div><h1>${t[0]}</h1><p>${t[1]}</p></div>
+      <form class="setup" id="auth" novalidate>
+        ${fields}
+        ${note}
+        <button class="btn" type="submit"${authBusy || !Cloud.configured() ? ' disabled' : ''}>${authBusy ? 'Please wait…' : btn}</button>
+        <div class="auth-links">${links}</div>
+      </form>
+      <p class="hint" style="text-align:center">Free, no ads. Only you can see your budget.</p>
+    </div>`;
+  }
+  function toSignIn(text) {
+    clearTimeout(pushTimer);
+    S = blank(); meta = { rev: 0, dirty: false, editedAt: 0 };
+    view = 'auth'; authMode = 'in'; authMsg = text ? { text } : null;
+    if (draft) closeEditor();
+    if (payDraft) closePay();
+    render();
+  }
+  async function submitAuth() {
+    const f = document.getElementById('auth');
+    const email = f.elements.email ? f.elements.email.value.trim() : '';
+    const password = f.elements.password ? f.elements.password.value : '';
+    const fail = text => { authBusy = false; authMsg = { text }; render(); refill(email); };
+    if (authMode !== 'reset' && !/^\S+@\S+\.\S+$/.test(email)) return fail('Please enter your email address.');
+    if (authMode !== 'forgot' && !password) return fail('Please enter your password.');
+    if ((authMode === 'up' || authMode === 'reset') && password.length < 8) return fail('Please use a longer password — at least 8 characters.');
+    authBusy = true; authMsg = null; render(); refill(email);
+    try {
+      if (authMode === 'in') { await Cloud.signIn(email, password); authBusy = false; return enter(); }
+      if (authMode === 'up') {
+        const ses = await Cloud.signUp(email, password);
+        authBusy = false;
+        if (ses) return enter();
+        authMode = 'in'; authMsg = { ok: true, text: `Almost there — we sent a link to ${email}. Open it to confirm your email, then sign in.` };
+        render(); refill(email); return;
+      }
+      if (authMode === 'forgot') {
+        await Cloud.forgot(email);
+        authBusy = false; authMode = 'in'; authMsg = { ok: true, text: `If there's an account for ${email}, a reset link is on its way. Check your inbox.` };
+        render(); refill(email); return;
+      }
+      await Cloud.setPassword(password);
+      authBusy = false;
+      enter('Password changed');
+    } catch (e) { fail(e.message); }
+  }
+  function refill(email) {
+    const el = document.querySelector('#auth [name="email"]');
+    if (el && email) el.value = email;
+  }
+  // Signed in: show this device's copy straight away, then catch up with the account.
+  function enter(msg) {
+    authMsg = null; confirmOut = false; authMode = 'in';
+    S = loadLocal();
+    view = S.profile ? 'home' : 'setup';
+    tab = 'other';
+    rollover();
+    render();
+    window.scrollTo(0, 0);
+    if (msg) toast(msg);
+    pull().then(() => refreshRate(false));
+  }
+  function signOut() {
+    if (meta.dirty && !confirmOut) { confirmOut = true; render(); return; }
+    // Don't leave this budget on a shared phone or computer.
+    try { localStorage.removeItem(userKey()); } catch (e) { /* ignore */ }
+    Cloud.signOut();
+    confirmOut = false;
+    toSignIn();
+    toast('Signed out');
   }
 
   function readSetup() {
@@ -466,7 +703,7 @@
     return {
       name: v('name').trim(), home: v('home'), other: v('other'), salary: num(v('salary')),
       freq: v('freq'), last: v('last'), nth: +v('nth'), wd: +v('wd'),
-      manual: f.elements.manual ? f.elements.manual.checked : false, rate: num(v('rate'))
+      ratemode: v('ratemode') || 'market', manual: v('ratemode') === 'own', margin: num(v('margin')), rate: num(v('rate'))
     };
   }
 
@@ -481,6 +718,14 @@
     if (rl) rl.textContent = `${sym(p.home).trim()}1 =`;
     const mf = document.getElementById('manual-f');
     if (mf) mf.hidden = !p.manual;
+    document.querySelectorAll('[data-act="ratemode"]').forEach(b => b.setAttribute('aria-pressed', b.dataset.mode === p.ratemode));
+    const gf = document.getElementById('margin-f');
+    if (gf) {
+      gf.hidden = p.ratemode !== 'margin';
+      document.getElementById('margin-l').textContent = sym(p.other).trim();
+      const mt = document.getElementById('margin-t'), mk = +mt.dataset.market;
+      mt.textContent = mk && p.margin > 0 && p.margin < mk ? `Today: ${sym(p.home)}1 = ${sym(p.other)}${(mk - p.margin).toFixed(2)} (market ${mk.toFixed(2)})` : '';
+    }
     const rb = document.getElementById('rate-box');
     if (rb) rb.hidden = p.home === p.other;
     const tiles = document.getElementById('pay-tiles');
@@ -495,9 +740,10 @@
     if (!p.name) return fail('Please enter your name.');
     if (!(p.salary > 0)) return fail('Please enter your salary for each payday.');
     if (p.freq !== 'custom' && !p.last) return fail('Please pick your last payday.');
-    if (p.manual && !(p.rate > 0)) return fail('Please enter your exchange rate, or untick "Use my own exchange rate".');
+    if (p.manual && !(p.rate > 0)) return fail('Please enter your exchange rate, or pick Market rate.');
+    if (p.ratemode === 'margin' && !(p.margin > 0)) return fail('Please enter the margin, or pick Market rate.');
     const first = !S.profile, old = S.profile;
-    S.profile = { name: p.name, home: p.home, other: p.other, salary: p.salary, freq: p.freq, last: p.last || ymd(today()), nth: p.nth, wd: p.wd };
+    S.profile = { name: p.name, home: p.home, other: p.other, salary: p.salary, freq: p.freq, last: p.last || ymd(today()), nth: p.nth, wd: p.wd, margin: p.ratemode === 'margin' ? p.margin : 0 };
     if (old) {
       for (const it of S.items) {
         if (it.cur === old.home) it.cur = p.home;
@@ -591,6 +837,7 @@
     const item = {
       id: d.id || S.nextId++, list: d.list, name: d.name.trim(), amt, cur: d.cur, rep: d.rep, due: d.due,
       left: d.rep !== 'once' && d.left !== '' ? left : 0,
+      paid: d.paid || [],
       created: d.created || ymd(new Date(Math.min(today(), parse(d.due))))
     };
     const i = S.items.findIndex(x => x.id === item.id);
@@ -612,6 +859,89 @@
     toast(`Removed ${gone.name}`, { label: 'Undo', run: () => { S.items.splice(undo.index, 0, undo.item); save(); render(); } });
   }
 
+  // Tick: marks the next unpaid due date this month as paid; once all are paid, a tap clears this month's ticks.
+  function togglePaid(id) {
+    const it = S.items.find(x => x.id === id);
+    if (!it) return;
+    const t = today(), occ = occurrences(it, new Date(t.getFullYear(), t.getMonth(), 1), monthEnd(t)).map(ymd);
+    if (!occ.length) return;
+    const paid = (it.paid || []).filter(k => k >= ymd(new Date(t.getFullYear() - 1, t.getMonth(), 1))); // keep a year
+    const open = occ.filter(k => !paid.includes(k));
+    it.paid = open.length ? paid.concat(open[0]) : paid.filter(k => !occ.includes(k));
+    save();
+    render();
+    if (open.length) toast(`${it.name}: paid`, { label: 'Undo', run: () => { it.paid = it.paid.filter(k => k !== open[0]); save(); render(); } });
+  }
+
+  // ---------- month pay editor ----------
+  // payDraft: { key, pays: [{date, amt:string}], extras: [{name, amt:string}] }
+  function openPay(key) {
+    const k = key || monthKey(today()), m = monthPay(k), f = keyToDate(k);
+    payDraft = {
+      key: k,
+      pays: paydays(f, monthEnd(f)).map(d => ({ date: ymd(d), amt: m.pays[ymd(d)] != null ? String(m.pays[ymd(d)]) : '' })),
+      extras: m.extras.map(x => ({ name: x.name, amt: String(x.amt) }))
+    };
+    clearTimeout(toastTimer);
+    $toast.hidden = true;
+    renderPay();
+  }
+  function closePay() { payDraft = null; $modal.innerHTML = ''; }
+  function payTotal() {
+    const base = S.profile.salary;
+    return payDraft.pays.reduce((a, x) => a + (x.amt.trim() === '' ? base : num(x.amt)), 0)
+      + payDraft.extras.reduce((a, x) => a + num(x.amt), 0);
+  }
+  function renderPay() {
+    const p = S.profile, d = payDraft, f = keyToDate(d.key), cur = monthKey(today());
+    const canPrev = d.key > cur, canNext = d.key < monthKey(new Date(today().getFullYear(), today().getMonth() + 12, 1));
+    const s = sym(p.home).trim();
+    const pays = d.pays.length ? d.pays.map((x, i) => {
+      const dt = parse(x.date);
+      return `<div class="pay-row"><span class="cal"><small>${DOW[dt.getDay()]}</small><b>${dt.getDate()}</b></span><span class="pay-l">Payday<small>${MON[dt.getMonth()]} ${dt.getFullYear()}</small></span>
+        <span class="prefix"><span>${esc(s)}</span><input class="num" data-pay="${i}" inputmode="decimal" value="${esc(x.amt)}" placeholder="${esc(p.salary.toFixed(2))}" aria-label="Pay on ${esc(shortDate(dt))}"></span></div>`;
+    }).join('') : `<p class="sub">No payday this month.</p>`;
+    const extras = d.extras.map((x, i) => `<div class="extra-row">
+        <input class="inp" data-xname="${i}" value="${esc(x.name)}" placeholder="e.g. Bonus" maxlength="40" aria-label="What is it">
+        <span class="prefix"><span>${esc(s)}</span><input class="num" data-xamt="${i}" inputmode="decimal" value="${esc(x.amt)}" placeholder="0.00" aria-label="Amount"></span>
+        <button type="button" class="x-btn" data-act="x-del" data-i="${i}" aria-label="Remove">${ICON.x}</button></div>`).join('');
+    $modal.innerHTML = `<div class="overlay" data-act="scrim"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-t">
+      <div class="dlg-head"><h2 id="dlg-t">Your pay</h2></div>
+      <div class="mon-sw">
+        <button type="button" class="x-btn" data-act="p-prev" aria-label="Previous month"${canPrev ? '' : ' disabled'}>${ICON.chevL}</button>
+        <b>${MON_LONG[f.getMonth()]} ${f.getFullYear()}</b>
+        <button type="button" class="x-btn" data-act="p-next" aria-label="Next month"${canNext ? '' : ' disabled'}>${ICON.chevR}</button>
+      </div>
+      <div class="fld"><span>Paydays</span>${pays}<small>Leave a payday empty for your usual ${money(p.salary, p.home)}. Change it when the pay is different.</small></div>
+      <div class="fld"><span>Extra income</span>${extras}
+        <button type="button" class="add-btn" data-act="x-add" style="margin:0">${ICON.plus}Add extra income</button>
+        <small>A bonus, overtime, tax refund, side job — anything on top of your pay this month.</small></div>
+      <div class="pay-total"><span>Income in ${MON_LONG[f.getMonth()]}</span><b id="p-total">${money(payTotal(), p.home)}</b></div>
+      <p class="err" id="p-err" hidden></p>
+      <div class="dlg-actions">
+        <button type="button" class="btn-ghost" data-act="cancel">Cancel</button>
+        <button type="button" class="btn" data-act="save-pay">Save</button>
+      </div>
+    </div></div>`;
+  }
+  function savePay(silent) {
+    const d = payDraft, err = document.getElementById('p-err');
+    const fail = m => { if (err) { err.textContent = m; err.hidden = false; } return false; };
+    const pays = {}, extras = [];
+    for (const x of d.pays) if (x.amt.trim() !== '') pays[x.date] = Math.round(num(x.amt) * 100) / 100;
+    for (const x of d.extras) {
+      if (!x.name.trim() && !x.amt.trim()) continue;
+      if (!(num(x.amt) > 0)) return fail('Please enter an amount for each extra income, or remove it.');
+      extras.push({ name: x.name.trim() || 'Extra income', amt: Math.round(num(x.amt) * 100) / 100 });
+    }
+    if (!S.pay) S.pay = {};
+    if (Object.keys(pays).length || extras.length) S.pay[d.key] = { pays, extras };
+    else delete S.pay[d.key];
+    save();
+    if (!silent) { closePay(); render(); toast('Pay saved'); }
+    return true;
+  }
+
   // ---------- backup ----------
   function backup() {
     const blob = new Blob([JSON.stringify(S, null, 2)], { type: 'application/json' });
@@ -623,11 +953,33 @@
     setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
     toast('Backup saved to your downloads');
   }
+  // A cost list (kind: 'budgetwise-costs') adds to the budget instead of replacing it.
+  function importCosts(list) {
+    const p = S.profile, t = ymd(today());
+    const REPS = REPEATS.map(r => r[0]);
+    let added = 0;
+    for (const x of list) {
+      const amt = num(x.amt), lst = x.list === 'home' ? 'home' : 'other';
+      if (!x.name || !(amt > 0)) continue;
+      const cur = x.cur === 'home' || x.cur === p.home ? p.home : x.cur === 'other' || x.cur === p.other ? p.other : lst === 'home' ? p.home : p.other;
+      const rep = REPS.includes(x.rep) ? x.rep : 'month';
+      const due = /^\d{4}-\d{2}-\d{2}$/.test(x.due || '') ? x.due : t;
+      S.items.push({ id: S.nextId++, list: lst, name: String(x.name).slice(0, 60), amt, cur, rep, due,
+        left: rep !== 'once' && x.left > 0 ? Math.floor(x.left) : 0, paid: [], created: due < t ? due : t });
+      added++;
+    }
+    if (!added) return toast('No costs found in that file');
+    save();
+    view = 'home';
+    render();
+    toast(`Added ${added} cost${added === 1 ? '' : 's'}`);
+  }
   function restore(file) {
     const r = new FileReader();
     r.onload = () => {
       try {
         const s = JSON.parse(r.result);
+        if (s && s.kind === 'budgetwise-costs' && Array.isArray(s.items)) return importCosts(s.items);
         if (!s || s.v !== 1 || !s.profile || !Array.isArray(s.items)) throw new Error('bad');
         S = Object.assign(blank(), s);
         save();
@@ -649,14 +1001,23 @@
     else if (act === 'tab') { tab = b.dataset.tab; render(); }
     else if (act === 'rate') refreshRate(true);
     else if (act === 'add') openEditor(null, b.dataset.list);
+    else if (act === 'paid') togglePaid(+b.dataset.id);
+    else if (act === 'pay') openPay();
     else if (act === 'edit') { const it = S.items.find(x => x.id === +b.dataset.id); if (it) openEditor(it); }
     else if (act === 'month') { openMonth = openMonth === b.dataset.key && b.classList.contains('month-btn') ? '-' : b.dataset.key; render(); }
+    else if (act === 'ratemode') { document.querySelector('#setup [name="ratemode"]').value = b.dataset.mode; syncSetup(); }
     else if (act === 'freq') { document.querySelector('#setup [name="freq"]').value = b.dataset.freq; syncSetup(); }
     else if (act === 'backup') backup();
+    else if (act === 'signout') signOut();
+    else if (act === 'auth-mode') { const em = document.querySelector('#auth [name="email"]'), v = em ? em.value : ''; authMode = b.dataset.mode; authMsg = null; render(); refill(v); }
+    else if (act === 'peek') { const i = b.previousElementSibling, show = i.type === 'password'; i.type = show ? 'text' : 'password'; b.textContent = show ? 'Hide' : 'Show'; b.setAttribute('aria-label', show ? 'Hide password' : 'Show password'); }
     else if (act === 'reset') {
       if (!confirmReset) { confirmReset = true; render(); return; }
-      try { localStorage.removeItem(KEY); } catch (err) { /* ignore */ }
-      S = blank(); confirmReset = false; view = 'setup'; render(); toast('Everything deleted');
+      clearTimeout(pushTimer);
+      S = blank(); meta = { rev: 0, dirty: false, editedAt: 0 }; confirmReset = false;
+      try { localStorage.removeItem(userKey()); } catch (err) { /* ignore */ }
+      Cloud.remove().then(() => toast('Your budget was deleted'), () => toast('Deleted here — could not reach your account, so it may come back. Try again online.'));
+      view = 'setup'; render();
     }
   });
   $app.addEventListener('input', e => { if (e.target.closest('#setup')) syncSetup(); });
@@ -664,9 +1025,29 @@
     if (e.target.matches('[data-act="restore"]') && e.target.files[0]) restore(e.target.files[0]);
     else if (e.target.closest('#setup')) syncSetup();
   });
-  $app.addEventListener('submit', e => { e.preventDefault(); submitSetup(); });
+  $app.addEventListener('submit', e => { e.preventDefault(); if (e.target.id === 'auth') { if (!authBusy) submitAuth(); } else submitSetup(); });
 
   $modal.addEventListener('click', e => {
+    if (payDraft) {
+      if (e.target.matches('[data-act="scrim"]')) return closePay();
+      const b = e.target.closest('[data-act]');
+      if (!b) return;
+      const act = b.dataset.act;
+      if (act === 'cancel') closePay();
+      else if (act === 'save-pay') savePay();
+      else if (act === 'x-add') {
+        payDraft.extras.push({ name: '', amt: '' }); renderPay();
+        const el = document.querySelector(`[data-xname="${payDraft.extras.length - 1}"]`); if (el) el.focus();
+      }
+      else if (act === 'x-del') { payDraft.extras.splice(+b.dataset.i, 1); renderPay(); }
+      else if (act === 'p-prev' || act === 'p-next') {
+        if (!savePay(true)) return;
+        const f = keyToDate(payDraft.key);
+        openPay(monthKey(new Date(f.getFullYear(), f.getMonth() + (act === 'p-next' ? 1 : -1), 1)));
+        render();
+      }
+      return;
+    }
     if (!draft) return;
     if (e.target.matches('[data-act="scrim"]')) return closeEditor();
     const b = e.target.closest('[data-act]');
@@ -679,6 +1060,15 @@
     else if (act === 'rep') { draft.rep = b.dataset.rep; renderEditor(); }
   });
   $modal.addEventListener('input', e => {
+    if (payDraft) {
+      const t = e.target, ds = t.dataset;
+      if (ds.pay != null) payDraft.pays[+ds.pay].amt = t.value;
+      else if (ds.xname != null) payDraft.extras[+ds.xname].name = t.value;
+      else if (ds.xamt != null) payDraft.extras[+ds.xamt].amt = t.value;
+      const tot = document.getElementById('p-total');
+      if (tot) tot.textContent = money(payTotal(), S.profile.home);
+      return;
+    }
     if (!draft) return;
     const id = e.target.id;
     if (id === 'd-name') draft.name = e.target.value;
@@ -697,17 +1087,24 @@
       if (l) l.focus();
     }
   });
-  document.addEventListener('keydown', e => { if (e.key === 'Escape' && draft) closeEditor(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') { if (draft) closeEditor(); else if (payDraft) closePay(); } });
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState !== 'visible' || !S.profile) return;
+    if (!Cloud.user) return;
+    if (document.visibilityState === 'hidden') { if (meta.dirty) push(); return; }
     rollover();
-    if (!draft && view !== 'setup') render();
-    refreshRate(false);
+    if (!draft && !payDraft && view !== 'setup' && view !== 'auth') render();
+    pull().then(() => refreshRate(false));
   });
+  window.addEventListener('online', () => { if (Cloud.user) { if (meta.dirty) push(); else pull(); } });
 
   // ---------- start ----------
-  rollover();
-  render();
-  refreshRate(false);
+  (async () => {
+    let link = null;
+    try { link = await Cloud.fromLink(); } catch (e) { link = { error: e.offline ? 'You seem to be offline. Try the link again when connected.' : 'That link did not work. Please ask for a new one.' }; }
+    if (link && link.error) { view = 'auth'; authMsg = { text: link.error }; render(); return; }
+    if (!Cloud.user) { view = 'auth'; render(); return; }
+    if (link && link.type === 'recovery') { view = 'auth'; authMode = 'reset'; render(); return; }
+    enter(link ? 'Email confirmed — welcome!' : '');
+  })();
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 })();

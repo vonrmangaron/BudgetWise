@@ -323,3 +323,53 @@ select.inp { appearance: none; -webkit-appearance: none; padding-right: 32px; ba
 }
 
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+
+/* Month pay */
+.hero-grid .pay-btn { display: flex; flex-direction: column; gap: 2px; min-width: 0; text-align: left; background: var(--hero-soft); border: 0; border-radius: 8px; color: inherit; padding: 6px 8px; margin: -6px 0 -6px -8px; }
+.hero-grid .pay-btn:hover { background: rgba(255, 255, 255, .14); }
+.pay-btn small:first-child { display: flex; align-items: center; gap: 4px; }
+.mon-sw { display: flex; align-items: center; justify-content: space-between; gap: 8px; border: 1px solid var(--line); border-radius: 10px; padding: 4px; }
+.mon-sw b { font-family: Manrope, Inter, sans-serif; font-weight: 800; font-size: 15px; }
+.x-btn { width: 40px; height: 40px; flex: none; display: flex; align-items: center; justify-content: center; border: 0; border-radius: 8px; background: transparent; color: var(--ink2); }
+.x-btn:hover { background: var(--hover); }
+.x-btn:disabled { opacity: .3; }
+.pay-row { display: flex; align-items: center; gap: 10px; }
+.pay-l { flex: 1; min-width: 0; font-weight: 600; font-size: 14px; display: flex; flex-direction: column; }
+.pay-l small { font-weight: 400; }
+.pay-row .prefix { width: 150px; flex: none; }
+.pay-row .prefix input, .extra-row .prefix input { text-align: right; font-variant-numeric: tabular-nums; }
+.extra-row { display: grid; grid-template-columns: minmax(0, 1fr) 128px 40px; gap: 6px; align-items: center; }
+.pay-total { display: flex; justify-content: space-between; align-items: baseline; border-top: 1px solid var(--line); padding-top: 12px; font-weight: 600; }
+.pay-total b { font-family: Manrope, Inter, sans-serif; font-size: 20px; font-weight: 800; font-variant-numeric: tabular-nums; }
+
+/* Accounts */
+.btn:disabled { opacity: .55; }
+.link { border: 0; background: none; padding: 4px 0; color: var(--other); font-weight: 600; font-size: inherit; text-decoration: underline; text-underline-offset: 3px; }
+.pw { position: relative; display: block; }
+.pw .inp { padding-right: 70px; }
+.pw-eye { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); border: 0; background: transparent; color: var(--muted); font-weight: 600; font-size: 13px; padding: 8px 10px; border-radius: 6px; }
+.pw-eye:hover { background: var(--hover); }
+.auth-links { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 16px; font-size: 14px; color: var(--muted); }
+.note-ok { margin: 0; color: var(--home); font-size: 13px; font-weight: 600; line-height: 1.45; }
+.acct { display: flex; align-items: center; gap: 12px; }
+.acct-ini { width: 40px; height: 40px; flex: none; border-radius: 50%; background: var(--other-tint); color: var(--other); font-weight: 800; display: flex; align-items: center; justify-content: center; font-family: Manrope, Inter, sans-serif; }
+.acct-m { display: flex; flex-direction: column; min-width: 0; }
+.acct-m b { overflow-wrap: anywhere; }
+.sync-dot { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.sync-dot::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+.sync-dot[data-sync="ok"]::before { background: var(--home); }
+.sync-dot[data-sync="saving"]::before { background: var(--other); }
+.sync-dot[data-sync="offline"]::before, .sync-dot[data-sync="error"]::before { background: var(--amber-ink); }
+
+/* Paid tick */
+.row-w { display: flex; align-items: center; gap: 0; border-bottom: 1px solid var(--line2); }
+.row-w .row { border-bottom: 0; }
+.row-w .row.has-tick { padding-left: 10px; }
+.tick { width: 36px; height: 36px; flex: none; margin-left: 4px; border-radius: 50%; border: 2px solid var(--field-line); background: var(--surface); color: transparent; display: flex; align-items: center; justify-content: center; padding: 0; }
+.tick:hover { border-color: var(--home); color: var(--home); }
+.tick.on { background: var(--home); border-color: var(--home); color: var(--surface); }
+.tick.part { border-color: var(--home); color: var(--home); }
+.tick small { font-size: 10px; font-weight: 800; }
+.row-w.is-paid .row-name, .row-w.is-paid .row-amt b { color: var(--muted); }
+.row-amt .due.paid { color: var(--home); }
+.rate-opts { display: flex; flex-direction: column; gap: 8px; }
